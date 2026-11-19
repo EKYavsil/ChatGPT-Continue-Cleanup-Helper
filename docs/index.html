@@ -56,8 +56,8 @@
       </div>
       <div class="workflow-layout">
         <ol class="flow-list">
-          <li><h3>Find the files</h3><p>The extension reads generated file references from the latest completed assistant reply in the active ChatGPT conversation.</p></li>
-          <li><h3>Download the batch</h3><p>Files are resolved by ID and saved to the folder you choose. The extension checks each browser download before starting the next.</p></li>
+          <li><h3>Find the files</h3><p>After ChatGPT finishes responding, the extension looks for file links or download controls, starting with the most recent reply.</p></li>
+          <li><h3>Download the batch</h3><p>Each file gets its turn. Direct downloads go into the folder you choose, and a local history helps skip files already saved.</p></li>
           <li><h3>Send the follow-up</h3><p>After the final download and a short delay, the extension sends your configured text. The default message is <code>continue</code>.</p></li>
         </ol>
         <aside class="panel settings" aria-label="Default extension settings">
@@ -68,7 +68,7 @@
             <div><dt>Between downloads</dt><dd>2 seconds</dd></div>
             <div><dt>Continue text</dt><dd><code>continue</code></dd></div>
           </dl>
-          <p>Adjust <strong>Delay before downloading</strong> to change how long the extension waits before starting a batch.</p>
+          <p>If a link appears before the file is ready, increase <strong>Delay before clicking</strong> in the popup.</p>
         </aside>
       </div>
     </section>
@@ -103,8 +103,8 @@
         <h2 id="privacy-title">What the extension keeps in your browser</h2>
       </div>
       <div class="technical-grid">
-        <article class="panel"><h3>Local download history</h3><p>The extension keeps IDs and progress for each processed reply in your browser profile. <strong>Clear download history</strong> pauses Continue and forgets these records. Files stay on disk.</p></article>
-        <article class="panel"><h3>Session and diagnostics</h3><p>Both modes use your signed-in ChatGPT session. The popup reports interrupted downloads and unconfirmed follow-ups. Temporary delivery URLs are kept out of the extension’s stored records.</p></article>
+        <article class="panel"><h3>Local download history</h3><p>Your browser profile stores settings, the latest status and up to 500 download-history entries. Entries can include full URLs, file labels and conversation paths. <strong>Clear download history</strong> removes the records and leaves saved files on disk.</p></article>
+        <article class="panel"><h3>Session and diagnostics</h3><p>Cleanup uses your signed-in ChatGPT session. Console output can include file labels and download links. Review logs for private details before sharing them.</p></article>
       </div>
       <p class="test-note">The automated tests use simulated chats and downloads to check cleanup, download order and retries. <a href="https://github.com/EKYavsil/ChatGPT-Continue-Cleanup-Helper/blob/main/tests/README.md">Read the test report</a>.</p>
     </section>

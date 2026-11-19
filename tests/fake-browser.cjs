@@ -1,32 +1,30 @@
 const { readFileSync } = require("node:fs");
 const { resolve } = require("node:path");
-const vm = require("node:vm");
+const { runInNewContext } = require("node:vm");
 
-function load(name, context) {
-  vm.runInContext(readFileSync(resolve(__dirname, "..", name), "utf8"), context, { filename: name });
+function loadScript(name, globals) {
+  const source = readFileSync(resolve(__dirname, "..", name), "utf8");
+  runInNewContext(source, globals, { filename: name });
 }
 
-function createPage(sentMessages, pageLanguage, sidebarChats) {
+function createPage(files, sentMessages, pageLanguage, sidebarChats) {
   const rect = () => ({ width: 120, height: 24, left: 0 });
-  const location = new URL("https://chatgpt.com/c/sample");
-  const composer = Object.assign(new EventTarget(), {
-    tagName: "TEXTAREA", value: "", focus() {}, closest() { return null; }, dispatchEvent() {}
-  });
-  const userRows = [];
+  const links = files.map((name) => ({
+    href: "https://files.example.invalid/" + name,
+    innerText: name,
+    hasAttribute: (attr) => attr === "download",
+    getAttribute: (attr) => attr === "download" ? name : null
+  }));
+  const message = {
+    getBoundingClientRect: rect,
+    querySelectorAll: (selector) => selector === "a[href]" ? links : []
+  };
+  const composer = { tagName: "TEXTAREA", value: "", focus() {}, dispatchEvent() {} };
   const sendButton = {
-    dataset: { testid: "send-button" },
-    matches(selector) { return selector.includes('button[data-testid="send-button"]'); },
-    getBoundingClientRect: rect, getAttribute: () => null,
-    click() {
-      sentMessages.push(composer.value);
-      userRows.push({ innerText: composer.value });
-      composer.value = "";
-    }
+    getBoundingClientRect: rect,
+    click: () => sentMessages.push(composer.value)
   };
-  const row = {
-    id: "reply-1", textContent: "Example", closest() { return this; },
-    getAttribute(key) { return key === "data-message-id" ? this.id : "assistant"; }
-  };
+  const location = new URL("https://chat.example.invalid/c/sample");
   const sidebarLinks = sidebarChats.map(({ id, title }) => ({
     href: new URL("/c/" + id, location).href,
     innerText: title,
@@ -43,8 +41,8 @@ function createPage(sentMessages, pageLanguage, sidebarChats) {
     }
   };
   return {
-    location, baseURI: location.href, composer, row, sendButton, visibilityState: "visible",
-    addEventListener() {}, documentElement: { lang: pageLanguage },
+    location, baseURI: location.href,
+    documentElement: { lang: pageLanguage },
     querySelector(selector) {
       if (selector === "#prompt-textarea") return composer;
       if (selector === "#composer-submit-button") return sendButton;
@@ -52,134 +50,106 @@ function createPage(sentMessages, pageLanguage, sidebarChats) {
     },
     querySelectorAll(selector) {
       if (selector === "aside, nav, [role='navigation']") return [sidebar];
-      if (selector === "[data-message-author-role]") return [row];
-      if (selector.includes('button[data-testid="send-button"]')) return [sendButton];
-      if (selector.includes('="user"')) return userRows;
-      return [];
+      return selector === '[data-message-author-role="assistant"]' ? [message] : [];
     }
-  };
-}
-
-function conversation(files, replyId = "reply-1") {
-  return {
-    current_node: replyId, conversation_id: "sample",
-    messages: [{
-      id: replyId, author: { role: "assistant" }, status: "finished_successfully", end_turn: true,
-      metadata: { content_references: files.map((name, i) => ({ type: "file", name, id: "file_" + i })) }
-    }]
   };
 }
 
 function createBrowser({
   settings = {}, files = [], conversations = [], listStatus = 200, pageLanguage = "en",
-  sidebarChats = [], conversationDetails = {}, response = conversation(files), resolveFile
+  sidebarChats = [], conversationDetails = {}
 } = {}) {
   const storage = structuredClone(settings);
-  const requests = [], downloads = [], sentMessages = [], statuses = [];
-  const listeners = [];
-  const locks = new Set();
-  let receive, activeTab = 1;
-  const pages = [];
-  const wakeDelay = (resolve, ms) => [250, 750].includes(ms) ? setImmediate(resolve) : queueMicrotask(resolve);
-  let clockOffset = 0;
-  class TestDate extends Date {
-    static now() { return Date.now() + clockOffset; }
-  }
+  const requests = [];
+  const downloads = [];
+  const sentMessages = [];
+  const statuses = [];
+  const downloadListeners = new Set();
+  let receiveMessage;
+  let runTick;
+
   const chrome = {
-    runtime: { onInstalled: { addListener() {} }, getURL: path => "chrome-extension://fixture/" + path,
-      onMessage: { addListener(fn) { receive = fn; } } },
-    storage: {
-      onChanged: { addListener(fn) { listeners.push(fn); } },
-      local: {
-        async get(keys) {
-          if (keys === null) return structuredClone(storage);
-          const names = typeof keys === "string" ? [keys] : Object.keys(keys);
-          const out = typeof keys === "object" ? { ...keys } : {};
-          for (const name of names) if (Object.hasOwn(storage, name)) out[name] = storage[name];
-          return structuredClone(out);
-        },
-        async set(patch) {
-          const changed = {};
-          for (const [k, v] of Object.entries(patch)) if (storage[k] !== v) changed[k] = { newValue: v };
-          Object.assign(storage, structuredClone(patch));
-          if (patch.status) statuses.push(patch.status);
-          listeners.forEach(fn => fn(changed, "local"));
-        },
-        async remove(keys) { keys.forEach(key => delete storage[key]); }
+    runtime: {
+      onInstalled: { addListener() {} },
+      onMessage: { addListener(listener) { receiveMessage = listener; } },
+      sendMessage(message, reply) {
+        if (message.type === "STATUS") statuses.push(message.status);
+        receiveMessage(message, {}, reply);
       }
     },
-    tabs: { query: async () => [{ id: activeTab, url: pages[activeTab - 1]?.document.location.href }] },
+    storage: {
+      local: {
+        get(keys, reply) {
+          const values = Array.isArray(keys) ? {} : { ...keys };
+          for (const key of Array.isArray(keys) ? keys : Object.keys(keys)) {
+            if (Object.hasOwn(storage, key)) values[key] = storage[key];
+          }
+          reply(structuredClone(values));
+        },
+        set(patch, done) { Object.assign(storage, structuredClone(patch)); done(); }
+      }
+    },
     downloads: {
-      async download(options) {
+      download(options, reply) {
         const id = downloads.length + 1;
-        downloads.push({ id, ...options, state: "in_progress", bytesReceived: 3 });
-        return id;
+        downloads.push({ id, url: options.url, state: "in_progress" });
+        reply(id);
       },
-      async search({ id }) { return downloads.filter(item => item.id === id); }
+      search({ id }, reply) { reply(downloads.filter((item) => item.id === id)); },
+      onChanged: {
+        addListener(listener) { downloadListeners.add(listener); },
+        removeListener(listener) { downloadListeners.delete(listener); }
+      }
     }
   };
-  function restartWorker() {
-    const ctx = vm.createContext({ chrome, URL, crypto });
-    ctx.importScripts = name => load(name, ctx);
-    load("background.js", ctx);
-  }
-  restartWorker();
-  function openTab() {
-    const id = pages.length + 1;
-    const document = createPage(sentMessages, pageLanguage, sidebarChats);
-    const sender = { tab: { id }, frameId: 0, url: document.location.href };
-    const runtime = { ...chrome.runtime, sendMessage(message, cb) { receive(message, sender, cb); } };
-    const tab = { document };
-    pages.push(tab);
-    const ctx = vm.createContext({
-      chrome: { ...chrome, runtime }, document, location: document.location, URL, URLSearchParams, Date: TestDate,
-      window: { innerWidth: 1024, addEventListener() {}, getComputedStyle: () => ({ display: "block", visibility: "visible" }) },
-      navigator: { locks: { async request(key, opts, fn) {
-        if (locks.has(key)) return fn(null);
-        locks.add(key);
-        try { return await fn({}); } finally { locks.delete(key); }
-      } } },
-      InputEvent: class {}, MutationObserver: class { observe() {} },
-      console: { info() {}, warn() {} }, setInterval(fn) { tab.tick = fn; },
-      setTimeout(fn, ms) { if (ms !== 400) wakeDelay(fn, ms); return 1; },
-      async fetch(path, options = {}) {
-        const url = new URL(path, document.location);
-        const method = options.method || "GET";
-        requests.push({ method, path: url.pathname, body: options.body });
-        if (url.origin !== document.location.origin) throw new Error("Unexpected fetch origin");
-        if (url.pathname === "/api/auth/session") return Response.json({});
-        if (method === "GET" && url.pathname === "/backend-api/conversations") {
-          const offset = Number(url.searchParams.get("offset")), limit = Number(url.searchParams.get("limit"));
-          return Response.json({ items: conversations.slice(offset, offset + limit) }, { status: listStatus });
-        }
-        if (method === "PATCH" && url.pathname.startsWith("/backend-api/conversation/")) return Response.json({});
-        if (method === "GET" && url.pathname.startsWith("/backend-api/conversation/")) {
-          const key = url.pathname.split("/").pop();
-          return Object.hasOwn(conversationDetails, key) ? Response.json(conversationDetails[key]) : Response.json({}, { status: 404 });
-        }
-        if (url.pathname === "/backend-api/conversations/sample") return Response.json(response);
-        if (url.pathname.startsWith("/backend-api/files/download/")) {
-          const key = url.pathname.split("/").pop();
-          if (resolveFile) return resolveFile(key);
-          const ref = response.messages.flatMap(m => m.metadata?.content_references || []).find(f => f.id === key);
-          return Response.json({ status: "success", file_name: ref.name, file_size_bytes: 3, mime_type: null,
-            download_url: document.location.origin + "/backend-api/estuary/content?id=" + key + "&sig=fixture" });
-        }
-        throw new Error("Unexpected fixture request: " + method + " " + url.pathname);
+
+  loadScript("background.js", {
+    chrome, clearTimeout,
+    setTimeout: (callback, delay) => setTimeout(callback, delay).unref()
+  });
+  const document = createPage(files, sentMessages, pageLanguage, sidebarChats);
+  loadScript("content.js", {
+    chrome, document, location: document.location, URL, URLSearchParams,
+    window: { innerWidth: 1024, getComputedStyle: () => ({ display: "block", visibility: "visible" }) },
+    InputEvent: class {},
+    console: { info() {}, warn() {} },
+    setInterval(callback) { runTick = callback; },
+    setTimeout: queueMicrotask,
+    async fetch(path, options = {}) {
+      const url = new URL(path, document.location);
+      const method = options.method || "GET";
+      requests.push({ method, path: url.pathname, body: options.body });
+      if (url.origin !== document.location.origin) throw new Error("Unexpected fetch origin");
+      if (method === "GET" && url.pathname === "/api/auth/session") return Response.json({});
+      if (method === "GET" && url.pathname === "/backend-api/conversations") {
+        const offset = Number(url.searchParams.get("offset"));
+        const limit = Number(url.searchParams.get("limit"));
+        return Response.json({ items: conversations.slice(offset, offset + limit) }, { status: listStatus });
       }
-    });
-    load("file-api.js", ctx);
-    load("content.js", ctx);
-    return tab;
+      if (method === "PATCH" && url.pathname.startsWith("/backend-api/conversation/")) {
+        return Response.json({});
+      }
+      if (method === "GET" && url.pathname.startsWith("/backend-api/conversation/")) {
+        const id = decodeURIComponent(url.pathname.split("/").pop());
+        return Object.hasOwn(conversationDetails, id)
+          ? Response.json(conversationDetails[id])
+          : Response.json({}, { status: 404 });
+      }
+      throw new Error("Unexpected fixture request: " + method + " " + url.pathname);
+    }
+  });
+
+  function updateDownload(id, state) {
+    const item = downloads.find((download) => download.id === id);
+    if (!item) throw new Error("Unknown fixture download " + id);
+    item.state = state;
+    for (const listener of downloadListeners) listener({ id, state: { current: state } });
   }
-  const tab = openTab();
-  return { ...tab, storage, requests, downloads, sentMessages, statuses, response, openTab, restartWorker,
-    advanceTime(ms) { clockOffset += ms; },
-    onStorageChange(listener) { listeners.push(listener); },
-    activate(id) { activeTab = id; },
-    updateDownload(id, state, bytes = 3) { Object.assign(downloads[id - 1], { state, bytesReceived: bytes }); },
-    send: (message) => new Promise(resolve => receive(message, {}, resolve))
+
+  return {
+    tick: runTick, storage, requests, downloads, sentMessages, statuses, updateDownload,
+    send: (message) => new Promise((reply) => chrome.runtime.sendMessage(message, reply))
   };
 }
 
-module.exports = { createBrowser, conversation };
+module.exports = { createBrowser };

@@ -1,5 +1,3 @@
-importScripts("file-api.js");
-
 const DEFAULT_STATE = {
   enabled: false,
   deleteNonProjectChatsEnabled: false,
@@ -7,165 +5,343 @@ const DEFAULT_STATE = {
   downloadSubfolder: "ChatGPT",
   delayBeforeDownloadMs: 10000,
   delayBetweenDownloadsMs: 2000,
+  downloadedKeys: [],
   status: "Ready"
 };
 
-const settings = () => chrome.storage.local.get(DEFAULT_STATE);
-const write = (patch) => chrome.storage.local.set(patch);
-let pending = Promise.resolve();
+const DOWNLOAD_COMPLETE_TIMEOUT_MS = 10 * 60 * 1000;
+const CLICK_DOWNLOAD_TIMEOUT_MS = 2 * 60 * 1000;
+const DOWNLOAD_WATCH_RESULT_TTL_MS = 5 * 60 * 1000;
 
-function serialize(operation) {
-  const result = pending.then(operation);
-  pending = result.catch(() => {});
-  return result;
+const activeDownloadWatches = new Map();
+let nextDownloadWatchId = 1;
+
+async function getState() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(DEFAULT_STATE, (items) => {
+      resolve({ ...DEFAULT_STATE, ...items });
+    });
+  });
 }
 
-function filenamePart(value) {
-  return String(value || "").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim()
-    .replace(/^\.+|[. ]+$/g, "").slice(0, 160) || "file";
+async function setState(patch) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set(patch, resolve);
+  });
 }
 
-function documentFormat(mime, name = "") {
-  const type = String(mime || "").split(";")[0].trim().toLowerCase();
-  if (type === "text/html" || type === "application/xhtml+xml" || /\.x?html?$/i.test(name)) return "html";
-  if (/[/+]json$/.test(type) || /\.(?:[a-z]*json|jsonl|ipynb|map)$/i.test(name)) return "json";
+function sanitizeFilenamePart(value) {
+  return String(value || "chatgpt-file")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+}
+
+function extensionFromLabel(label) {
+  const lower = String(label || "").toLowerCase();
+  if (lower.includes("zip")) return ".zip";
+  if (lower.includes("jsonl")) return ".jsonl";
+  if (lower.includes("json")) return ".json";
+  if (lower.includes("markdown") || lower.includes("md")) return ".md";
+  if (lower.includes("csv")) return ".csv";
+  if (lower.includes("report")) return ".md";
   return "";
 }
 
-async function activeOrigin(sender, conversationId) {
-  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (!tab?.url || tab.id !== sender.tab?.id || sender.frameId !== 0) return null;
-  const url = new URL(tab.url);
-  return ["https://chatgpt.com", "https://chat.openai.com"].includes(url.origin) &&
-    ChatFiles.conversationId(url.pathname) === conversationId ? url.origin : null;
+function buildFilename(file, subfolder) {
+  const label = sanitizeFilenamePart(file.label);
+  const ext = extensionFromLabel(label);
+  const hasKnownExt = /\.[a-z0-9]{2,8}$/i.test(label);
+  const name = hasKnownExt || !ext ? label : `${label}${ext}`;
+  const folder = sanitizeFilenamePart(subfolder || "ChatGPT");
+  return `${folder}/${name}`;
 }
 
-async function batchOperation(message, sender) {
-  const { conversationId, replyId, fileId } = message;
-  if (!ChatFiles.validId(conversationId) || !ChatFiles.validId(replyId)) throw new Error("Invalid reply identity.");
-  const key = `batch/${conversationId}/${replyId}`;
-  const batch = (await chrome.storage.local.get(key))[key] || { files: {}, followup: "ready" };
-  if (message.type === "CANCEL_SEND") {
-    if (batch.followup === "reserved" && typeof message.reservation === "string" &&
-        message.reservation === batch.reservation) {
-      batch.followup = "ready";
-      delete batch.reservation;
-      await write({ [key]: batch });
-    }
-    return { ok: true };
-  }
-  const state = await settings();
-  const origin = await activeOrigin(sender, conversationId);
-  if (!state.enabled || state.deleteNonProjectChatsEnabled || !origin) return { paused: true };
-  if (message.type === "BATCH_STATE") return { batch };
-  if (message.type === "CONFIRM_SEND") {
-    if (batch.followup === "reserved" && (!message.reservation || message.reservation === batch.reservation)) {
-      batch.followup = "sent";
-      delete batch.reservation;
-      await write({ [key]: batch });
-    }
-    return { batch };
-  }
-  if (batch.followup !== "ready") return { batch };
-  if (message.type === "RESERVE_SEND") {
-    const ids = message.fileIds;
-    if (!Array.isArray(ids) || !ids.length || !ids.every(id => ChatFiles.validFileId(id) && batch.files[id]?.state === "complete")) {
-      throw new Error("The reply still has unfinished downloads.");
-    }
-    batch.followup = "reserved";
-    batch.reservation = crypto.randomUUID();
-    await write({ [key]: batch });
-    return { reserved: true, reservation: batch.reservation };
-  }
+function waitForDownloadComplete(downloadId, timeoutMs = DOWNLOAD_COMPLETE_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      chrome.downloads.onChanged.removeListener(onChanged);
+      reject(new Error("Download timed out before completion."));
+    }, timeoutMs);
 
-  if (!ChatFiles.validFileId(fileId)) throw new Error("Invalid file identity.");
-  const record = batch.files[fileId];
-  if (message.type === "START_FILE") {
-    if (record && record.state !== "interrupted") return { state: record.state };
-    const { size, name, url, mime } = message.file;
-    if (typeof name !== "string" || (size !== null && (!Number.isSafeInteger(size) || size < 0))) {
-      throw new Error("Invalid download metadata.");
+    function finish(error) {
+      clearTimeout(timeoutId);
+      chrome.downloads.onChanged.removeListener(onChanged);
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
     }
-    const address = ChatFiles.contentURL(url, origin, fileId);
-    batch.files[fileId] = { state: "starting", size };
-    await write({ [key]: batch });
-    let id;
-    try {
-      id = await chrome.downloads.download({
-        url: address, filename: filenamePart(state.downloadSubfolder) + "/" + filenamePart(name),
-        conflictAction: "uniquify", saveAs: false
-      });
-    } catch {
-      batch.files[fileId].state = "interrupted";
-      await write({ [key]: batch });
-      throw new Error("The browser could not start this download.");
-    }
-    batch.files[fileId] = { id, size, format: documentFormat(mime, name), state: "in_progress" };
-    await write({ [key]: batch });
-    return { state: "in_progress" };
-  }
 
-  if (message.type !== "CHECK_FILE" || !record) throw new Error("Unknown download.");
-  if (record.state !== "in_progress") return { state: record.state };
-  const [item] = await chrome.downloads.search({ id: record.id });
-  if (!item || item.state === "interrupted") {
-    record.state = "interrupted";
-  } else if (item.state === "complete") {
-    let valid = false;
-    try {
-      ChatFiles.contentURL(item.finalUrl || item.url, origin, fileId);
-      const format = documentFormat(item.mime);
-      valid = (!format || format === record.format) && (record.size === null || record.size === item.bytesReceived);
-    } catch { /* The server returned a different resource. */ }
-    record.state = valid ? "complete" : "unverified";
-  } else {
-    return { state: "in_progress" };
-  }
-  await write({ [key]: batch });
-  return { state: record.state };
+    function onChanged(delta) {
+      if (delta.id !== downloadId || !delta.state?.current) return;
+
+      if (delta.state.current === "complete") {
+        finish();
+        return;
+      }
+
+      if (delta.state.current === "interrupted") {
+        finish(new Error("Download was interrupted."));
+      }
+    }
+
+    chrome.downloads.onChanged.addListener(onChanged);
+    chrome.downloads.search({ id: downloadId }, (items) => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        finish(new Error(err.message));
+        return;
+      }
+
+      const item = items[0];
+      if (!item) {
+        finish(new Error("Download item was not found."));
+        return;
+      }
+
+      if (item.state === "complete") {
+        finish();
+        return;
+      }
+
+      if (item.state === "interrupted") {
+        finish(new Error("Download was interrupted."));
+      }
+    });
+  });
 }
 
-const operations = new Set(["BATCH_STATE", "START_FILE", "CHECK_FILE", "RESERVE_SEND", "CANCEL_SEND", "CONFIRM_SEND"]);
+function createDownloadWatch(startedAt = Date.now(), timeoutMs = CLICK_DOWNLOAD_TIMEOUT_MS) {
+  const watchId = String(nextDownloadWatchId);
+  nextDownloadWatchId += 1;
 
-async function handle(message, sender) {
-  if (message.type === "ACTIVE_CHAT") return { active: Boolean(await activeOrigin(sender, message.conversationId)) };
-  if (operations.has(message.type)) return batchOperation(message, sender);
-  if (message.type === "GET_STATE") return settings();
-  if (message.type === "STATUS") {
-    await write({ status: message.status || "Running" });
-    return { ok: true };
-  }
-  if (sender.tab && sender.url !== chrome.runtime.getURL("popup.html")) throw new Error("Unknown request.");
-  if (message.type === "SET_STATE") {
-    const patch = {};
-    for (const field of Object.keys(DEFAULT_STATE)) {
-      if (field !== "status" && Object.hasOwn(message.patch, field)) patch[field] = message.patch[field];
+  let watchedDownloadId = null;
+  let settled = false;
+
+  const promise = new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      finish(new Error("No download completed after the click."));
+    }, timeoutMs);
+
+    function finish(error, result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      chrome.downloads.onCreated.removeListener(onCreated);
+      chrome.downloads.onChanged.removeListener(onChanged);
+
+      if (error) {
+        reject(error);
+      } else {
+        resolve(result);
+      }
+
+      setTimeout(() => {
+        activeDownloadWatches.delete(watchId);
+      }, DOWNLOAD_WATCH_RESULT_TTL_MS);
     }
-    await write(patch);
-    return settings();
-  }
-  if (message.type === "RESET_HISTORY") {
-    await write({ enabled: false });
-    const keys = Object.keys(await chrome.storage.local.get(null));
-    await chrome.storage.local.remove(keys.filter(key => key.startsWith("batch/") || ["downloadedKeys", "lastDownload"].includes(key)));
-    await write({ status: "Download history cleared" });
-    return settings();
-  }
-  throw new Error("Unknown request.");
+
+    function shouldWatchItem(item) {
+      const itemStartedAt = Date.parse(item.startTime || "");
+      return Number.isFinite(itemStartedAt) && itemStartedAt >= startedAt;
+    }
+
+    function watchItem(item) {
+      if (settled || watchedDownloadId !== null || !shouldWatchItem(item)) return;
+
+      watchedDownloadId = item.id;
+      if (item.state === "complete") {
+        finish(null, { downloadId: item.id, filename: item.filename });
+        return;
+      }
+
+      if (item.state === "interrupted") {
+        finish(new Error("Download was interrupted."));
+      }
+    }
+
+    function onCreated(item) {
+      watchItem(item);
+    }
+
+    function onChanged(delta) {
+      if (delta.id !== watchedDownloadId || !delta.state?.current) return;
+
+      if (delta.state.current === "complete") {
+        chrome.downloads.search({ id: delta.id }, (items) => {
+          const item = items[0];
+          finish(null, { downloadId: delta.id, filename: item?.filename || "" });
+        });
+        return;
+      }
+
+      if (delta.state.current === "interrupted") {
+        finish(new Error("Download was interrupted."));
+      }
+    }
+
+    chrome.downloads.onCreated.addListener(onCreated);
+    chrome.downloads.onChanged.addListener(onChanged);
+    chrome.downloads.search(
+      {
+        startedAfter: new Date(startedAt).toISOString(),
+        orderBy: ["-startTime"],
+        limit: 5
+      },
+      (items) => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          finish(new Error(err.message));
+          return;
+        }
+
+        items.reverse().forEach(watchItem);
+      }
+    );
+  });
+
+  promise.catch(() => {});
+  activeDownloadWatches.set(watchId, promise);
+  return watchId;
 }
 
-chrome.runtime.onInstalled.addListener(({ reason }) => {
-  if (!["install", "update"].includes(reason)) return;
-  return serialize(async () => {
-    await chrome.storage.local.remove(["downloadedKeys", "lastDownload"]);
-    await write({ enabled: false, deleteNonProjectChatsEnabled: false, status: "Ready" });
+async function downloadUrl(file) {
+  const state = await getState();
+  const key = file.key || file.url || file.label;
+
+  if (state.downloadedKeys.includes(key)) {
+    return { skipped: true, reason: "This file was already downloaded." };
+  }
+
+  const filename = buildFilename(file, state.downloadSubfolder);
+
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download(
+      {
+        url: file.url,
+        filename,
+        conflictAction: "uniquify",
+        saveAs: false
+      },
+      async (downloadId) => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          reject(new Error(err.message));
+          return;
+        }
+
+        try {
+          await waitForDownloadComplete(downloadId);
+        } catch (error) {
+          reject(error);
+          return;
+        }
+
+        const downloadedKeys = [...state.downloadedKeys, key].slice(-500);
+        await setState({
+          downloadedKeys,
+          lastDownload: {
+            id: downloadId,
+            label: file.label,
+            filename,
+            at: new Date().toISOString()
+          },
+          status: `Downloaded: ${file.label}`
+        });
+        resolve({ downloadId, filename });
+      }
+    );
+  });
+}
+
+chrome.runtime.onInstalled.addListener(async (details) => {
+  if (!["install", "update"].includes(details.reason)) return;
+
+  const current = await new Promise((resolve) => {
+    chrome.storage.local.get(["continueText"], resolve);
+  });
+
+  await setState({
+    enabled: false,
+    deleteNonProjectChatsEnabled: false,
+    continueText: current.continueText || DEFAULT_STATE.continueText,
+    status: "Ready"
   });
 });
 
-chrome.runtime.onMessage.addListener((message, sender, reply) => {
-  const action = operations.has(message.type) || message.type === "RESET_HISTORY"
-    ? serialize(() => handle(message, sender))
-    : handle(message, sender);
-  action.then(reply, error => reply({ error: error.message }));
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  (async () => {
+    if (message?.type === "GET_STATE") {
+      sendResponse(await getState());
+      return;
+    }
+
+    if (message?.type === "SET_STATE") {
+      await setState(message.patch || {});
+      sendResponse(await getState());
+      return;
+    }
+
+    if (message?.type === "RESET_HISTORY") {
+      await setState({ downloadedKeys: [], lastDownload: null, status: "Download history cleared" });
+      sendResponse(await getState());
+      return;
+    }
+
+    if (message?.type === "STATUS") {
+      await setState({ status: message.status || "Running" });
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message?.type === "DOWNLOAD_FILE" && message.file?.url) {
+      const result = await downloadUrl(message.file);
+      sendResponse({ ok: true, ...result });
+      return;
+    }
+
+    if (message?.type === "START_DOWNLOAD_WATCH") {
+      const watchId = createDownloadWatch(message.startedAt || Date.now());
+      sendResponse({ ok: true, watchId });
+      return;
+    }
+
+    if (message?.type === "WAIT_DOWNLOAD_WATCH" && message.watchId) {
+      const promise = activeDownloadWatches.get(String(message.watchId));
+      if (!promise) {
+        sendResponse({ ok: false, error: "Download watch was not found." });
+        return;
+      }
+
+      const result = await promise;
+      sendResponse({ ok: true, ...result });
+      return;
+    }
+
+    if (message?.type === "MARK_DOWNLOADED" && message.file?.key) {
+      const state = await getState();
+      const downloadedKeys = [...state.downloadedKeys, message.file.key].slice(-500);
+      await setState({
+        downloadedKeys,
+        lastDownload: {
+          label: message.file.label,
+          filename: message.file.label,
+          at: new Date().toISOString()
+        },
+        status: `Downloaded: ${message.file.label}`
+      });
+      sendResponse({ ok: true });
+      return;
+    }
+
+    sendResponse({ ok: false, error: "Unknown message" });
+  })().catch(async (error) => {
+    await setState({ status: `Error: ${error.message}` });
+    sendResponse({ ok: false, error: error.message });
+  });
+
   return true;
 });

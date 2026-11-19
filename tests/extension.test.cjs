@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { setImmediate: nextTurn } = require("node:timers/promises");
-const { createBrowser, conversation } = require("./fake-browser.cjs");
+const { createBrowser } = require("./fake-browser.cjs");
 
 const cleanupOn = { deleteNonProjectChatsEnabled: true };
 const downloadsOn = { enabled: true, continueText: "Next sample, please." };
@@ -12,8 +12,8 @@ test("Download mode leaves conversations alone when cleanup is disabled", async 
     conversations: [{ id: "sample-personal" }]
   });
   await browser.tick();
-  assert.ok(browser.requests.every(request => request.method === "GET"));
-  assert.match(browser.storage.status, /no generated files/i);
+  assert.deepEqual(browser.requests, []);
+  assert.match(browser.storage.status, /waiting for downloadable files/i);
 });
 
 test("Cleanup skips supported project markers and hides only the ordinary chat", async () => {
@@ -128,355 +128,54 @@ test("Sidebar cleanup stops when the page language is unknown or non-English", a
   }
 });
 
-const job = browser => browser.storage["batch/sample/reply-1"];
-const names = browser => browser.downloads.map(item => item.filename);
-const start = async browser => {
-  const done = browser.tick();
+test("Downloads complete in order before the configured continue message is sent", async () => {
+  const browser = createBrowser({ settings: downloadsOn, files: ["first.csv", "second.csv"] });
+  const tick = browser.tick();
   await nextTurn();
-  return { done };
-};
+  assert.deepEqual(browser.downloads.map((item) => item.url), ["https://files.example.invalid/first.csv"]);
+  assert.deepEqual(browser.sentMessages, []);
 
-test("Downloads every distinct file in order and confirms one follow-up", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.csv", "sample.csv"] });
-  const refs = b.response.messages[0].metadata.content_references;
-  refs.push({ ...refs[0] });
-  const { done } = await start(b);
-  assert.deepEqual(names(b), ["ChatGPT/sample.csv"]);
-  b.updateDownload(1, "complete");
+  browser.updateDownload(1, "complete");
   await nextTurn();
-  assert.deepEqual(names(b), ["ChatGPT/sample.csv", "ChatGPT/sample.csv"]);
-  assert.deepEqual(b.sentMessages, []);
-  b.updateDownload(2, "complete");
-  await done;
-  assert.deepEqual(b.sentMessages, [downloadsOn.continueText]);
-  assert.equal(job(b).followup, "sent");
-  assert.doesNotMatch(JSON.stringify(b.storage), /sig=|estuary/);
-  const other = b.openTab();
-  b.activate(2);
-  await other.tick();
-  assert.equal(b.downloads.length, 2);
-  assert.equal(b.sentMessages.length, 1);
+  assert.deepEqual(browser.downloads.map((item) => item.url), [
+    "https://files.example.invalid/first.csv", "https://files.example.invalid/second.csv"
+  ]);
+  assert.deepEqual(browser.sentMessages, []);
+
+  browser.updateDownload(2, "complete");
+  await tick;
+  assert.deepEqual(browser.sentMessages, [downloadsOn.continueText]);
 });
 
-test("Only the current completed assistant reply is eligible", async () => {
-  for (const change of [
-    r => { r.messages[0].id = "old"; }, r => { r.messages[0].author.role = "user"; },
-    r => { r.messages[0].end_turn = false; }, r => { r.messages[0].status = "in_progress"; },
-    r => { r.messages[0].metadata.content_references = []; },
-    r => { r.messages[0].metadata.content_references[0].id = ""; },
-    r => { r.conversation_id = "wrong"; }
-  ]) {
-    const r = conversation(["sample.txt"]);
-    change(r);
-    const b = createBrowser({ settings: downloadsOn, response: r });
-    await b.tick();
-    assert.equal(b.downloads.length, 0);
-    assert.equal(b.sentMessages.length, 0);
-  }
-});
+const file = { key: "sample-file", label: "sample.csv", url: "https://files.example.invalid/sample.csv" };
 
-test("Inactive tabs do not fetch conversations", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  b.openTab();
-  b.activate(2);
-  await b.tick();
-  assert.deepEqual(b.requests, []);
-});
-
-test("A worker restart resumes the same browser download", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  const { done } = await start(b);
-  b.restartWorker();
-  b.updateDownload(1, "complete");
-  await done;
-  assert.equal(b.downloads.length, 1);
-  assert.equal(job(b).followup, "sent");
-});
-
-test("Interruptions can retry without repeating an earlier completed file", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["one.txt", "two.txt"] });
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
+test("A completed file is skipped when its key is requested again", async () => {
+  const browser = createBrowser();
+  const request = { type: "DOWNLOAD_FILE", file };
+  const pending = browser.send(request);
   await nextTurn();
-  b.updateDownload(2, "interrupted");
-  await done;
-  assert.equal(job(b).files.file_1.state, "interrupted");
-  await b.send({ type: "SET_STATE", patch: { enabled: false } });
-  await b.send({ type: "SET_STATE", patch: { enabled: true } });
-  const retry = await start(b);
-  assert.deepEqual(names(b), ["ChatGPT/one.txt", "ChatGPT/two.txt", "ChatGPT/two.txt"]);
-  b.updateDownload(3, "complete");
-  await retry.done;
-  assert.equal(job(b).followup, "sent");
-});
-
-test("Turning Continue off during a download stops the batch", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["one.txt", "two.txt"] });
-  const { done } = await start(b);
-  await b.send({ type: "SET_STATE", patch: { enabled: false } });
-  b.updateDownload(1, "complete");
-  await done;
-  assert.equal(b.downloads.length, 1);
-  assert.deepEqual(b.sentMessages, []);
-});
-
-test("Leaving the chat or switching tabs before completion prevents a send", async () => {
-  for (const change of [b => { b.document.location.pathname = "/c/elsewhere"; }, b => { b.openTab(); b.activate(2); }]) {
-    const b = createBrowser({ settings: downloadsOn, files: ["one.txt"] });
-    const { done } = await start(b);
-    change(b);
-    b.updateDownload(1, "complete");
-    await done;
-    assert.deepEqual(b.sentMessages, []);
-  }
-});
-
-test("A user draft is preserved and the completed download can be reused", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  b.document.composer.value = "My unfinished draft";
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
-  await done;
-  assert.equal(b.document.composer.value, "My unfinished draft");
-  assert.deepEqual(b.sentMessages, []);
-  b.document.composer.value = "";
-  await b.tick();
-  assert.equal(b.downloads.length, 1);
-  assert.equal(job(b).followup, "sent");
-});
-
-test("Missing send control preserves the empty composer and never clicks a fallback", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  b.document.sendButton.disabled = true;
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
-  await done;
-  assert.equal(b.document.composer.value, "");
-  assert.equal(job(b).followup, "ready");
-  assert.deepEqual(b.sentMessages, []);
-});
-
-test("A send button that becomes ready after the first poll sends once", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  b.document.sendButton.disabled = true;
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
+  browser.updateDownload(1, "complete");
+  assert.equal((await pending).ok, true);
+  const repeated = browser.send(request);
   await nextTurn();
+  assert.equal(browser.downloads.length, 1);
+  assert.equal((await repeated).skipped, true);
+});
+
+test("An interrupted download stays out of history and can be retried", async () => {
+  const browser = createBrowser();
+  const request = { type: "DOWNLOAD_FILE", file };
+  const pending = browser.send(request);
   await nextTurn();
-  assert.equal(b.document.composer.value, downloadsOn.continueText);
-  assert.deepEqual(b.sentMessages, []);
-  b.document.sendButton.disabled = false;
-  await done;
-  await b.tick();
-  assert.deepEqual(b.sentMessages, [downloadsOn.continueText]);
-  assert.equal(b.downloads.length, 1);
-});
+  browser.updateDownload(1, "interrupted");
+  const failure = await pending;
+  assert.equal(failure.ok, false);
+  assert.match(failure.error, /interrupted/i);
+  assert.deepEqual(Array.from((await browser.send({ type: "GET_STATE" })).downloadedKeys), []);
 
-test("Only the visible send action in the current composer is clicked", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  const button = b.document.sendButton;
-  const voice = {
-    ...button,
-    matches: selector => selector.includes("[data-composer-voice-start]"),
-    click: () => assert.fail("Voice control was clicked")
-  };
-  const other = {
-    ...button,
-    matches: () => false,
-    getAttribute: key => key === "aria-label" ? "Attach files" : null,
-    click: () => assert.fail("Attachment control was clicked")
-  };
-  const send = {
-    ...button,
-    matches: () => false,
-    getAttribute: key => key === "aria-label" ? "Mesajı gönder (Enter)" : null
-  };
-  const form = { querySelector: () => null, querySelectorAll: () => [voice, other, send] };
-  b.document.composer.closest = () => form;
-  button.click = () => assert.fail("A control outside the form was clicked");
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
-  await done;
-  assert.deepEqual(b.sentMessages, [downloadsOn.continueText]);
-});
-
-test("A send timeout retries the same completed file after the cooldown", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  b.document.sendButton.disabled = true;
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
-  await done;
-  assert.match(b.storage.status, /waiting for the send button/i);
-  assert.equal(b.document.composer.value, "");
-  b.document.sendButton.disabled = false;
-  await b.tick();
-  assert.deepEqual(b.sentMessages, []);
-  b.advanceTime(16000);
-  await b.tick();
-  await b.tick();
-  assert.deepEqual(b.sentMessages, [downloadsOn.continueText]);
-  assert.equal(b.downloads.length, 1);
-});
-
-test("An edit while waiting for the send button is preserved", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  b.document.sendButton.disabled = true;
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
+  const retry = browser.send(request);
   await nextTurn();
-  assert.equal(b.document.composer.value, downloadsOn.continueText);
-  b.document.composer.value = "My draft";
-  b.document.sendButton.disabled = false;
-  await done;
-  b.advanceTime(16000);
-  await b.tick();
-  assert.equal(b.document.composer.value, "My draft");
-  assert.deepEqual(b.sentMessages, []);
-  assert.equal(job(b).followup, "ready");
-});
-
-test("An edit after reservation releases the unclicked send for a later retry", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  let edited = false;
-  b.onStorageChange(changes => {
-    if (!edited && changes["batch/sample/reply-1"]?.newValue.followup === "reserved") {
-      b.document.composer.value = "My edit";
-      edited = true;
-    }
-  });
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
-  await done;
-  assert.equal(b.document.composer.value, "My edit");
-  assert.equal(job(b).followup, "ready");
-  assert.deepEqual(b.sentMessages, []);
-  b.document.composer.value = "";
-  b.advanceTime(16000);
-  await b.tick();
-  assert.deepEqual(b.sentMessages, [downloadsOn.continueText]);
-  assert.equal(b.downloads.length, 1);
-});
-
-test("Hiding the conversation while waiting prevents a follow-up", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  b.document.sendButton.disabled = true;
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
-  await nextTurn();
-  b.document.visibilityState = "hidden";
-  b.document.sendButton.disabled = false;
-  await done;
-  assert.equal(b.document.composer.value, "");
-  assert.equal(job(b).followup, "ready");
-  assert.deepEqual(b.sentMessages, []);
-});
-
-test("An unconfirmed send remains reserved across tabs and reloads", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  let clicks = 0;
-  b.document.sendButton.click = () => { clicks++; };
-  const { done } = await start(b);
-  b.updateDownload(1, "complete");
-  await done;
-  assert.equal(job(b).followup, "reserved");
-  const tab = b.openTab();
-  b.activate(2);
-  await tab.tick();
-  assert.equal(clicks, 1);
-  assert.deepEqual(b.sentMessages, []);
-});
-
-test("Only a matching file delivery address can start a download", async () => {
-  for (const url of ["https://example.invalid/?", "/backend-api/files/download/file_0",
-    "/backend-api/estuary/content?id=file_other"]) {
-    const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"], resolveFile: () => Response.json({
-      status: "success", file_name: "sample.txt", download_url: url
-    }) });
-    await b.tick();
-    assert.equal(b.downloads.length, 0);
-    assert.equal(b.sentMessages.length, 0);
-  }
-});
-
-test("Size mismatch or an unexpected final URL pauses the reply", async () => {
-  for (const change of [item => { item.bytesReceived = 2; }, item => { item.finalUrl = "https://chatgpt.com/login"; }]) {
-    const b = createBrowser({ settings: downloadsOn, files: ["one.txt"] });
-    const { done } = await start(b);
-    b.updateDownload(1, "complete");
-    change(b.downloads[0]);
-    await done;
-    assert.equal(job(b).files.file_0.state, "unverified");
-    assert.deepEqual(b.sentMessages, []);
-  }
-});
-
-test("A different download finishing cannot advance the batch", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  const { done } = await start(b);
-  b.downloads.push({ id: 99, state: "complete", bytesReceived: 3 });
-  await nextTurn();
-  assert.deepEqual(b.sentMessages, []);
-  assert.equal(job(b).files.file_0.state, "in_progress");
-  b.updateDownload(1, "complete");
-  await done;
-  assert.equal(job(b).followup, "sent");
-});
-
-test("A successful JSON error document cannot stand in for a text file of unknown size", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"], resolveFile: () => Response.json({
-    status: "success", file_name: "sample.txt", file_size_bytes: null, mime_type: null,
-    download_url: "/backend-api/estuary/content?id=file_0"
-  }) });
-  const { done } = await start(b);
-  b.downloads[0].mime = "application/problem+json";
-  b.updateDownload(1, "complete");
-  await done;
-  assert.equal(job(b).files.file_0.state, "unverified");
-  assert.equal(b.sentMessages.length, 0);
-});
-
-test("A zero-byte file is valid when the resolver reports zero bytes", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["empty.txt"], resolveFile: () => Response.json({
-    status: "success", file_name: "empty.txt", file_size_bytes: 0, mime_type: null,
-    download_url: "/backend-api/estuary/content?id=file_0"
-  }) });
-  const { done } = await start(b);
-  b.updateDownload(1, "complete", 0);
-  await done;
-  assert.equal(job(b).followup, "sent");
-});
-
-test("Rate limiting delays another request and leaves the composer untouched", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"],
-    resolveFile: () => new Response("", { status: 429, headers: { "retry-after": "30" } }) });
-  await b.tick();
-  const count = b.requests.length;
-  await b.tick();
-  assert.equal(b.requests.length, count);
-  assert.match(b.storage.status, /429/);
-  assert.equal(b.sentMessages.length, 0);
-});
-
-test("A new reply before submission invalidates the previous batch", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  const { done } = await start(b);
-  b.response.current_node = "newer-user-turn";
-  b.updateDownload(1, "complete");
-  await done;
-  assert.equal(b.sentMessages.length, 0);
-  assert.equal(job(b).followup, "ready");
-});
-
-test("Concurrent tabs cannot start a second download or reserve a second send", async () => {
-  const b = createBrowser({ settings: downloadsOn, files: ["sample.txt"] });
-  const other = b.openTab();
-  const { done } = await start(b);
-  b.activate(2);
-  await other.tick();
-  await done;
-  const second = await start(other);
-  assert.equal(b.downloads.length, 1);
-  b.updateDownload(1, "complete");
-  await second.done;
-  assert.equal(b.sentMessages.length, 1);
+  browser.updateDownload(2, "complete");
+  assert.equal((await retry).ok, true);
+  assert.equal(browser.downloads.length, 2);
 });

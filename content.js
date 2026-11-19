@@ -1,4 +1,5 @@
 const LOOP_INTERVAL_MS = 1400;
+const AFTER_SEND_COOLDOWN_MS = 8000;
 const DEBUG_PREFIX = "[ChatGPT File Continue & Cleanup Helper]";
 
 let isWorking = false;
@@ -9,6 +10,8 @@ const reviewedSidebarIds = new Set();
 let nextApiDeleteAt = 0;
 let cachedAccessToken = "";
 let cachedAccessTokenAt = 0;
+let lastSentAt = 0;
+let lastCandidateBatchKey = "";
 
 console.info(`${DEBUG_PREFIX} content script loaded`);
 
@@ -38,7 +41,6 @@ function visible(element) {
 
 function findComposer() {
   return (
-    document.querySelector('form[data-thread-find-composer] [data-composer-markdown][contenteditable="true"]') ||
     document.querySelector("#prompt-textarea") ||
     document.querySelector('div.ProseMirror[contenteditable="true"]') ||
     document.querySelector('textarea[data-id="root"]') ||
@@ -56,6 +58,83 @@ function isGenerating() {
 
   const streaming = document.querySelector(".result-streaming, [data-message-streaming='true']");
   return visible(streaming);
+}
+
+function getAssistantMessages() {
+  const roleMessages = [...document.querySelectorAll('[data-message-author-role="assistant"]')].filter(visible);
+  if (roleMessages.length) return roleMessages;
+
+  const articleMessages = [...document.querySelectorAll("article")].filter((node) => {
+    const text = node.innerText || "";
+    return text.trim().length > 0;
+  });
+
+  if (articleMessages.length) return articleMessages;
+
+  return [];
+}
+
+function linkLooksDownloadable(link) {
+  const text = (link.innerText || link.getAttribute("aria-label") || "").trim();
+  const href = link.href || "";
+  if (!href || href.startsWith("javascript:")) return false;
+
+  const haystack = `${text} ${href}`.toLowerCase();
+  return (
+    link.hasAttribute("download") ||
+    href.startsWith("blob:") ||
+    href.startsWith("sandbox:") ||
+    haystack.includes("download") ||
+    haystack.includes("sandbox") ||
+    haystack.includes("files") ||
+    haystack.includes(".zip") ||
+    haystack.includes(".jsonl") ||
+    haystack.includes(".json") ||
+    haystack.includes(".csv") ||
+    haystack.includes(".md") ||
+    haystack.includes("markdown")
+  );
+}
+
+function linkLooksSafeFallback(link) {
+  const href = link.href || "";
+  if (!href || href.startsWith("javascript:") || href.startsWith("#")) return false;
+
+  const haystack = `${textOf(link)} ${href} ${link.getAttribute("download") || ""}`.toLowerCase();
+  if (haystack.includes("chatgpt.com/share/")) return false;
+  if (haystack.includes("openai.com/policies")) return false;
+  if (haystack.includes("help.openai.com")) return false;
+
+  return (
+    link.hasAttribute("download") ||
+    href.startsWith("blob:") ||
+    href.startsWith("sandbox:") ||
+    haystack.includes("/files/") ||
+    haystack.includes("file-") ||
+    haystack.includes("download") ||
+    haystack.includes("attachment")
+  );
+}
+
+function clickableFor(element) {
+  return element.closest('a[href], button, [role="button"], [tabindex]') || element;
+}
+
+function activate(element) {
+  element.scrollIntoView({ block: "center", inline: "center" });
+  const rect = element.getBoundingClientRect();
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    view: window,
+    clientX: rect.left + Math.min(20, rect.width / 2),
+    clientY: rect.top + Math.min(10, rect.height / 2)
+  };
+
+  element.dispatchEvent(new MouseEvent("pointerdown", eventInit));
+  element.dispatchEvent(new MouseEvent("mousedown", eventInit));
+  element.dispatchEvent(new MouseEvent("mouseup", eventInit));
+  element.dispatchEvent(new MouseEvent("click", eventInit));
 }
 
 function wait(ms) {
@@ -428,300 +507,261 @@ async function deleteNonProjectChatTick() {
   }
 }
 
-let lastView = "";
-let modeVersion = 0;
-let retryAt = 0;
-let retryView = "";
-let failedView = "";
-let wakeTimer;
-let lastStatus = "";
-const nodeKeys = new WeakMap();
-let nextNodeKey = 0;
-let replyRevision = 0;
+function looksLikeSaveControl(element) {
+  const text = textOf(element).toLowerCase();
+  const aria = String(element.getAttribute?.("aria-label") || "").toLowerCase();
+  const title = String(element.getAttribute?.("title") || "").toLowerCase();
+  const value = String(element.getAttribute?.("value") || "").toLowerCase();
+  const haystack = `${text} ${aria} ${title} ${value}`;
 
-function currentView() {
-  const id = ChatFiles.conversationId(location.pathname);
-  if (!id || document.visibilityState !== "visible" || isGenerating()) return null;
-  const rows = document.querySelectorAll("[data-message-author-role]");
-  const row = rows[rows.length - 1];
-  if (row && row.getAttribute("data-message-author-role") !== "assistant") return null;
-  const turns = row ? [] : document.querySelectorAll("main article, main [data-testid^='conversation-turn-']");
-  const tail = row || turns[turns.length - 1] || document.querySelector("main");
-  if (!tail) return null;
-  const messageId = row?.closest("[data-message-id]")?.getAttribute("data-message-id");
-  if (!nodeKeys.has(tail)) nodeKeys.set(tail, ++nextNodeKey);
-  return { id, messageId, key: id + "/" + (messageId || nodeKeys.get(tail)) };
+  return element.hasAttribute("download") || haystack.includes("save") || haystack.includes("download");
 }
 
-function composerText(box) {
-  return (box?.value ?? box?.textContent ?? "").replace(/[\u200B\uFEFF]/g, "");
+function looksLikeFileControl(element) {
+  const href = element.href || "";
+  const download = String(element.getAttribute?.("download") || "");
+  const aria = String(element.getAttribute?.("aria-label") || "");
+  const title = String(element.getAttribute?.("title") || "");
+  const testid = String(element.getAttribute?.("data-testid") || "");
+  const haystack = `${textOf(element)} ${href} ${download} ${aria} ${title} ${testid}`.toLowerCase();
+
+  return (
+    element.matches?.("a[href]") ||
+    haystack.includes("download") ||
+    haystack.includes("file") ||
+    haystack.includes("sandbox") ||
+    haystack.includes(".zip") ||
+    haystack.includes(".jsonl") ||
+    haystack.includes(".json") ||
+    haystack.includes(".csv") ||
+    haystack.includes(".md") ||
+    haystack.includes(".txt")
+  );
 }
 
-function hasAttachments(box) {
-  return Boolean(box?.closest("form")?.querySelector(
-    '[data-testid*="remove-file"],[data-testid*="remove-attachment"],[data-testid="file-thumbnail"]'
-  ));
-}
+async function clickSaveControl(timeoutMs = 5000) {
+  const startedAt = Date.now();
+  const selector = [
+    "button",
+    "a[href]",
+    "[role='button']",
+    "input[type='button']",
+    "input[type='submit']"
+  ].join(",");
 
-function hasDraft(box) {
-  return Boolean(composerText(box)) || hasAttachments(box);
-}
+  while (Date.now() - startedAt < timeoutMs) {
+    const candidates = [...document.querySelectorAll(selector)]
+      .filter(visible)
+      .filter(looksLikeSaveControl);
 
-function setText(box, text) {
-  box.focus();
-  if (box.tagName === "TEXTAREA") {
-    const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(box), "value")?.set;
-    if (setter) setter.call(box, text);
-    else box.value = text;
-    box.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
-  } else {
-    const selection = document.getSelection();
-    if (text) {
-      const range = document.createRange();
-      range.selectNodeContents(box.querySelector("p") || box);
-      range.collapse(true);
-      selection.removeAllRanges();
-      selection.addRange(range);
-      document.execCommand("insertText", false, text);
-    } else {
-      selection.selectAllChildren(box);
-      document.execCommand("delete", false);
+    if (candidates.length) {
+      const control = candidates[candidates.length - 1];
+      console.info(DEBUG_PREFIX, "clicking save control", textOf(control));
+      activate(control);
+      return true;
     }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
+
+  return false;
 }
 
-function sendButton(box) {
-  const form = box.closest("form");
-  const selector = 'button[data-testid="send-button"], button#composer-submit-button, button[data-composer-submit]:not([data-composer-submit="false"])';
-  const buttons = form ? form.querySelectorAll("button") : document.querySelectorAll(selector);
-  for (const button of buttons) {
-    if (!visible(button) || button.disabled || button.getAttribute("aria-disabled") === "true") continue;
-    const label = normalizeText(button.getAttribute("aria-label") || button.title || button.textContent)
-      .replace(/\s*\((?:enter|return)\)$/, "");
-    if (button.matches("[data-composer-voice-start], [data-composer-stop]") ||
-        /voice|speech|stop|dictat|sesli|dikte|durdur/.test(label + " " + (button.dataset.testid || ""))) continue;
-    const namedSend = /^(?:send(?: (?:message|prompt))?|(?:mesaj[ıi]? |istem[iı]? |ileti(?:yi)? )?gonder)$/.test(label);
-    if (button.matches(selector) || (form && (namedSend ||
-        (button.matches('button[type="submit"]') && (!label || label === "submit"))))) {
-      return button;
+async function downloadCandidate(candidate) {
+  if (candidate.directDownload && /^https?:\/\//i.test(candidate.url || "")) {
+    const response = await sendMessage({ type: "DOWNLOAD_FILE", file: candidate });
+    if (response?.ok && !response.skipped) return true;
+    if (response?.ok && response.skipped) {
+      console.info(DEBUG_PREFIX, "download skipped by background", response.reason);
+      return true;
     }
+
+    console.warn(DEBUG_PREFIX, "background download failed, falling back to page click", response?.error);
   }
-  return null;
+
+  const watch = await sendMessage({ type: "START_DOWNLOAD_WATCH", startedAt: Date.now() });
+  activate(candidate.link);
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  await clickSaveControl();
+  const response = await sendMessage({ type: "WAIT_DOWNLOAD_WATCH", watchId: watch?.watchId });
+  if (!response?.ok) {
+    throw new Error(response?.error || "Clicked download did not complete.");
+  }
+  return true;
 }
 
-async function report(status) {
-  if (status === lastStatus) return;
-  lastStatus = status;
-  await sendMessage({ type: "STATUS", status });
+function makeKey(link, label, messageIndex, linkIndex) {
+  const href = link.href || "";
+  const explicit = link.getAttribute?.("download") || "";
+  return [href, explicit, label, messageIndex, linkIndex, document.location.pathname].join("|");
 }
 
-class Paused extends Error {}
+function latestFileCandidates() {
+  const messages = getAssistantMessages();
 
-async function ensureActive(view, version) {
-  const state = await getState();
-  if (!state?.enabled || state.deleteNonProjectChatsEnabled || version !== modeVersion ||
-      currentView()?.key !== view.key) throw new Paused();
-  return state;
-}
-
-async function operation(type, reply, extra = {}) {
-  const result = await sendMessage({ type, conversationId: reply.conversationId, replyId: reply.replyId, ...extra });
-  if (!result || result.paused) throw new Paused();
-  if (result.error) throw new Error(result.error);
-  return result;
-}
-
-async function saveFile(reply, file, record, view, version) {
-  if (record?.state === "complete") return;
-  let state = record?.state;
-  if (!state || state === "interrupted") {
-    const delivery = await ChatFiles.resolve(file, location.origin, chatgptBackendFetch);
-    await ensureActive(view, version);
-    ({ state } = await operation("START_FILE", reply, { fileId: file.id, file: { name: file.name, ...delivery } }));
-  }
-  while (state === "in_progress") {
-    await ensureActive(view, version);
-    ({ state } = await operation("CHECK_FILE", reply, { fileId: file.id }));
-    if (state === "in_progress") await wait(750);
-  }
-  if (state === "starting") throw new Error("Download start is uncertain. Check browser downloads.");
-  if (state === "unverified") throw new Error("Downloaded content did not match the expected file.");
-  if (state !== "complete") throw new Error("Download interrupted. Toggle Continue to retry.");
-}
-
-function userMessages() {
-  return [...document.querySelectorAll('[data-message-author-role="user"]')];
-}
-
-async function followUp(reply, view, version, text) {
-  const box = findComposer();
-  if (!box || hasDraft(box)) {
-    await report("Waiting for an empty message box");
-    return false;
-  }
-  const previousRows = userMessages();
-  const previousIds = new Set(previousRows.map(row => row.closest?.("[data-message-id]")?.getAttribute("data-message-id")).filter(Boolean));
-  let edited = false;
-  const onEdit = event => { if (event.isTrusted) edited = true; };
-  const ownsDraft = () => !edited && findComposer() === box && composerText(box) === text;
-  async function retrySend() {
-    retryView = view.key;
-    retryAt = Date.now() + 15000;
-    const status = ownsDraft() && !hasAttachments(box)
-      ? "Waiting for the send button. Will retry."
-      : "Message box changed. Waiting before retry.";
-    await report(status);
-    return false;
-  }
-  let reservation;
-  let clicked = false;
-  try {
-    setText(box, text);
-    box.addEventListener("beforeinput", onEdit, true);
-    for (let poll = 0; poll < 20; poll++) {
-      await ensureActive(view, version);
-      if (!ownsDraft() || hasAttachments(box)) break;
-      if (sendButton(box)) break;
-      await wait(250);
-    }
-    if (!ownsDraft() || hasAttachments(box) || !sendButton(box)) {
-      return await retrySend();
-    }
-    const result = await operation("RESERVE_SEND", reply, { fileIds: reply.files.map(file => file.id) });
-    reservation = result.reservation;
-    if (!reservation) return true;
-    if (!(await sendMessage({ type: "ACTIVE_CHAT", conversationId: view.id }))?.active) throw new Paused();
-    await ensureActive(view, version);
-    const button = sendButton(box);
-    if (!ownsDraft() || hasAttachments(box) || !button) return await retrySend();
-    clicked = true;
-    button.click();
-    for (let i = 0; i < 24; i++) {
-      if (ChatFiles.conversationId(location.pathname) !== view.id) break;
-      const rows = userMessages();
-      const row = rows[rows.length - 1];
-      const id = row?.closest?.("[data-message-id]")?.getAttribute("data-message-id");
-      const appended = id ? !previousIds.has(id) : rows.length > previousRows.length;
-      if (appended && row?.innerText?.trim() === text) {
-        await operation("CONFIRM_SEND", reply, { reservation });
-        await report("Continue message sent");
-        return true;
-      }
-      await wait(250);
-    }
-    await report("Send unconfirmed. Check the conversation before continuing.");
-    return true;
-  } finally {
-    box.removeEventListener("beforeinput", onEdit, true);
-    if (!clicked && ownsDraft() && !hasAttachments(box)) setText(box, "");
-    if (!clicked && reservation) {
-      await sendMessage({ type: "CANCEL_SEND", conversationId: reply.conversationId, replyId: reply.replyId, reservation });
-    }
-  }
-}
-
-async function processReply(view, version, state) {
-  const reply = await ChatFiles.latest(view.id, chatgptBackendFetch);
-  await ensureActive(view, version);
-  if (!reply || (view.messageId && view.messageId !== reply.replyId)) {
-    retryAt = Date.now() + 15000;
-    retryView = view.key;
-    await report("Waiting for the latest completed reply");
-    return false;
-  }
-  if (!reply.files.length) {
-    await report("No generated files in the latest reply");
-    return true;
-  }
-  const { batch } = await operation("BATCH_STATE", reply);
-  if (batch.followup !== "ready") {
-    await report(batch.followup === "sent" ? "Continue already sent for this reply" : "Previous send unconfirmed. Check the conversation.");
-    return true;
-  }
-  if (reply.files.some(file => batch.files[file.id]?.state !== "complete")) {
-    await wait(state.delayBeforeDownloadMs);
-    for (const [index, file] of reply.files.entries()) {
-      await ensureActive(view, version);
-      if (batch.files[file.id]?.state === "complete") continue;
-      await report(`Downloading file ${index + 1} of ${reply.files.length}`);
-      await saveFile(reply, file, batch.files[file.id], view, version);
-      await wait(state.delayBetweenDownloadsMs);
-    }
-  }
-  state = await ensureActive(view, version);
-  if (!findComposer() || hasDraft(findComposer())) {
-    await report("Waiting for an empty message box");
-    return true;
-  }
-  const latest = await ChatFiles.latest(view.id, chatgptBackendFetch);
-  await ensureActive(view, version);
-  if (latest?.replyId !== reply.replyId || latest.files.length !== reply.files.length ||
-      latest.files.some((file, i) => file.id !== reply.files[i].id)) return false;
-  return followUp(reply, view, version, String(state.continueText || "").trim() || "continue");
-}
-
-async function tick({ allowCleanup = true } = {}) {
-  if (isWorking) return;
-  isWorking = true;
-  let attempt = "";
-  const version = modeVersion;
-  try {
-    const state = await getState();
-    if (state?.deleteNonProjectChatsEnabled) {
-      if (allowCleanup) await deleteNonProjectChatTick();
-      return;
-    }
-    if (!state?.enabled) return;
-    const view = currentView();
-    if (!view) { lastView = ""; return; }
-    const box = findComposer();
-    attempt = [view.key, replyRevision, Boolean(box && !hasDraft(box))].join("/");
-    if (failedView === view.key || attempt === lastView || (retryView === view.key && Date.now() < retryAt)) return;
-    if (!(await sendMessage({ type: "ACTIVE_CHAT", conversationId: view.id }))?.active) return;
-    await navigator.locks.request("chat-file-helper/" + view.id, { ifAvailable: true }, async lock => {
-      if (lock && await processReply(view, version, state)) lastView = attempt;
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex];
+    const links = [...message.querySelectorAll("a[href]")].filter((link) => {
+      return linkLooksDownloadable(link) || linkLooksSafeFallback(link);
     });
-  } catch (error) {
-    if (error instanceof Paused) return;
-    if (error.retryMs) {
-      retryAt = Date.now() + error.retryMs;
-      retryView = currentView()?.key;
-    } else {
-      failedView = currentView()?.key || "";
+    if (!links.length) continue;
+
+    return links.map((link, linkIndex) => {
+      const label =
+        (link.innerText || link.getAttribute("download") || link.getAttribute("aria-label") || "ChatGPT file").trim();
+
+      return {
+        url: link.href,
+        label,
+        key: makeKey(link, label, messageIndex, linkIndex),
+        link,
+        directDownload: true
+      };
+    });
+  }
+
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex];
+    const controls = [...message.querySelectorAll("button, [role='button'], [tabindex]")]
+      .filter(visible)
+      .filter(looksLikeFileControl);
+    if (!controls.length) continue;
+
+    return controls.map((control, controlIndex) => {
+      const label = textOf(control) || control.getAttribute("aria-label") || "ChatGPT file";
+
+      return {
+        url: control.href || "",
+        label,
+        key: makeKey(control, label, messageIndex, controlIndex),
+        link: clickableFor(control),
+        directDownload: false
+      };
+    });
+  }
+
+  return [];
+}
+
+function setComposerText(composer, text) {
+  composer.focus();
+
+  if (composer.tagName === "TEXTAREA") {
+    composer.value = text;
+    composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+    return;
+  }
+
+  document.getSelection()?.selectAllChildren(composer);
+  document.execCommand("insertText", false, text);
+  composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+}
+
+function findSendButton() {
+  const selectors = [
+    "#composer-submit-button",
+    'button[aria-label*="Send prompt"]',
+    'button[data-testid="send-button"]',
+    'button[aria-label*="Send"]'
+  ];
+
+  for (const selector of selectors) {
+    const button = document.querySelector(selector);
+    if (visible(button) && !button.disabled) return button;
+  }
+
+  const composer = findComposer();
+  const form = composer?.closest("form");
+  return form ? [...form.querySelectorAll("button")].find((button) => visible(button) && !button.disabled) : null;
+}
+
+async function sendContinue(text) {
+  const composer = findComposer();
+  if (!composer) throw new Error("Message box was not found.");
+
+  setComposerText(composer, text);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
+  const button = findSendButton();
+  if (button) {
+    button.click();
+  } else {
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true })
+    );
+  }
+
+  lastSentAt = Date.now();
+}
+
+async function tick() {
+  if (isWorking) return;
+
+  const state = await getState();
+  if (state?.deleteNonProjectChatsEnabled) {
+    await deleteNonProjectChatTick();
+    return;
+  }
+
+  if (state?.enabled === false) return;
+  if (Date.now() - lastSentAt < AFTER_SEND_COOLDOWN_MS) return;
+
+  if (isGenerating()) {
+    await sendMessage({ type: "STATUS", status: "Waiting for ChatGPT response" });
+    return;
+  }
+
+  const candidates = latestFileCandidates();
+  if (!candidates.length) {
+    await sendMessage({ type: "STATUS", status: "Waiting for downloadable files in the latest message" });
+    return;
+  }
+
+  const candidateBatchKey = candidates.map((candidate) => candidate.key).join("\n");
+  if (candidateBatchKey === lastCandidateBatchKey) return;
+  lastCandidateBatchKey = candidateBatchKey;
+
+  isWorking = true;
+  try {
+    await sendMessage({ type: "STATUS", status: `Waiting for ${candidates.length} files to be ready` });
+    await new Promise((resolve) => setTimeout(resolve, state.delayBeforeDownloadMs ?? 10000));
+
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = candidates[index];
+      await sendMessage({
+        type: "STATUS",
+        status: `Downloading file (${index + 1}/${candidates.length}): ${candidate.label}`
+      });
+      console.info(DEBUG_PREFIX, "downloading file link", candidate.label, candidate.url);
+      await downloadCandidate(candidate);
+      await sendMessage({
+        type: "MARK_DOWNLOADED",
+        file: {
+          key: candidate.key,
+          label: candidate.label,
+          url: candidate.url
+        }
+      });
+
+      if (index < candidates.length - 1) {
+        await sendMessage({
+          type: "STATUS",
+          status: `Waiting before next download (${index + 1}/${candidates.length})`
+        });
+        await new Promise((resolve) => setTimeout(resolve, state.delayBetweenDownloadsMs ?? 2000));
+      }
     }
-    await report(error.message + (error.retryMs ? " Waiting before retry." : ""));
+
+    await sendMessage({ type: "STATUS", status: "Waiting before sending continue" });
+    await new Promise((resolve) => setTimeout(resolve, state.delayBetweenDownloadsMs ?? 2000));
+    await sendMessage({ type: "STATUS", status: `Sending "${state.continueText}"` });
+    await sendContinue(state.continueText || "continue");
+    await sendMessage({ type: "STATUS", status: "Continue message sent" });
+  } catch (error) {
+    await sendMessage({ type: "STATUS", status: `Error: ${error.message}` });
   } finally {
     isWorking = false;
   }
 }
 
-function wake() {
-  if (wakeTimer) return;
-  wakeTimer = setTimeout(() => {
-    wakeTimer = null;
-    void tick({ allowCleanup: false });
-  }, 400);
-}
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || (!changes.enabled && !changes.deleteNonProjectChatsEnabled)) return;
-  modeVersion++;
-  lastView = lastStatus = retryView = failedView = "";
-  wake();
-});
-document.addEventListener("visibilitychange", () => {
-  modeVersion++;
-  wake();
-});
-window.addEventListener("popstate", wake);
-new MutationObserver(records => {
-  const changed = records.some(record => {
-    const el = record.target.nodeType === 1 ? record.target : record.target.parentElement;
-    return el?.closest("main") && !el.closest("form, [contenteditable], textarea, nav, header, footer");
-  });
-  if (changed) {
-    replyRevision++;
-    wake();
-  }
-}).observe(document.documentElement, { childList: true, characterData: true, subtree: true });
 setInterval(tick, LOOP_INTERVAL_MS);
