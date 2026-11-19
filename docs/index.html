@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b1017">
+  <meta name="description" content="A Chrome and Brave extension that downloads files from ChatGPT replies in order, then sends a follow-up message. Includes an optional conversation cleanup mode.">
+  <meta property="og:title" content="ChatGPT File Continue &amp; Cleanup Helper">
+  <meta property="og:description" content="Download generated files one at a time and continue the conversation after the batch finishes.">
+  <title>ChatGPT File Continue &amp; Cleanup Helper</title>
+  <link rel="stylesheet" href="assets/site.css">
+  <link rel="stylesheet" href="assets/helper.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="nav">
+      <a class="brand" href="#main">ChatGPT File Helper</a>
+      <nav class="nav-links" aria-label="On this page">
+        <a href="#workflow">How it works</a>
+        <a href="#install">Install</a>
+        <a href="#cleanup">Cleanup</a>
+        <a href="#privacy">Privacy</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <figure class="hero-media">
+        <img src="assets/extension-popup.png" alt="Extension popup with both modes off, the continue message set to “continue” and the download folder set to “ChatGPT”.">
+        <figcaption>Extension popup with default settings</figcaption>
+      </figure>
+      <div class="hero-content">
+        <p class="eyebrow">ChatGPT File Continue &amp; Cleanup Helper</p>
+        <h1 id="hero-title">Download ChatGPT files in order, then continue the chat.</h1>
+        <p class="hero-copy">When a reply contains several files, the extension waits for each download to finish before starting the next. After the last file, it sends your follow-up message in the same conversation.</p>
+        <div class="hero-actions">
+          <a class="button primary" href="#install">Installation guide</a>
+          <a class="button secondary" href="#workflow">How it works</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="status-band" aria-label="Extension details">
+      <div><span class="status-label">Browsers</span><strong>Chrome &amp; Brave</strong></div>
+      <div><span class="status-label">Installation</span><strong>Load unpacked</strong></div>
+      <div><span class="status-label">Extension version</span><strong>1.1.3</strong></div>
+    </section>
+
+    <section class="section technical" id="workflow" aria-labelledby="workflow-title">
+      <div class="section-heading">
+        <p class="eyebrow">How it works</p>
+        <h2 id="workflow-title">From a finished reply to the next message</h2>
+      </div>
+      <div class="workflow-layout">
+        <ol class="flow-list">
+          <li><h3>Find the files</h3><p>The extension reads generated file references from the latest completed assistant reply in the active ChatGPT conversation.</p></li>
+          <li><h3>Download the batch</h3><p>Files are resolved by ID and saved to the folder you choose. The extension checks each browser download before starting the next.</p></li>
+          <li><h3>Send the follow-up</h3><p>After the final download and a short delay, the extension sends your configured text. The default message is <code>continue</code>.</p></li>
+        </ol>
+        <aside class="panel settings" aria-label="Default extension settings">
+          <h3>Default settings</h3>
+          <dl>
+            <div><dt>Download folder</dt><dd><code>ChatGPT</code></dd></div>
+            <div><dt>Before the first file</dt><dd>10 seconds</dd></div>
+            <div><dt>Between downloads</dt><dd>2 seconds</dd></div>
+            <div><dt>Continue text</dt><dd><code>continue</code></dd></div>
+          </dl>
+          <p>Adjust <strong>Delay before downloading</strong> to change how long the extension waits before starting a batch.</p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section repair" id="install" aria-labelledby="install-title">
+      <div class="section-heading">
+        <p class="eyebrow">Installation</p>
+        <h2 id="install-title">Load the extension in Chrome or Brave</h2>
+      </div>
+      <ol class="install-list">
+        <li><h3>Get the source</h3><p>Clone the repository, or open <strong>Code</strong> on GitHub and choose <strong>Download ZIP</strong>. Extract the archive and locate the folder containing <code>manifest.json</code>.</p></li>
+        <li><h3>Load the folder</h3><p>Open <code>chrome://extensions</code> or <code>brave://extensions</code>. Enable <strong>Developer mode</strong>, choose <strong>Load unpacked</strong> and select that folder.</p></li>
+        <li><h3>Start in ChatGPT</h3><p>Open or reload a conversation, open the extension popup and turn on <strong>ChatGPT Continue</strong>. Both modes start off after installation.</p></li>
+      </ol>
+      <div class="link-row"><a href="https://github.com/EKYavsil/ChatGPT-Continue-Cleanup-Helper">Open repository</a></div>
+    </section>
+
+    <section class="section warning-section cleanup" id="cleanup" aria-labelledby="cleanup-title">
+      <div class="cleanup-inner">
+        <p class="eyebrow">Optional cleanup</p>
+        <h2 id="cleanup-title">Cleanup acts on your account’s conversation list.</h2>
+        <div class="text-block">
+          <p><strong>Delete non-project chats</strong> processes one eligible conversation at a time, including chats other than the one you have open. It takes priority over downloads and proceeds without asking for confirmation on each chat.</p>
+          <p>Project chats are protected by ID for the current tab session. If the conversation list has no eligible chat, the extension can check links in an English sidebar. Before hiding a sidebar chat, it verifies that the ID matches and that ChatGPT explicitly reports no project membership. It skips unverified links, even when two chats have the same title.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="privacy" aria-labelledby="privacy-title">
+      <div class="section-heading">
+        <p class="eyebrow">Privacy &amp; testing</p>
+        <h2 id="privacy-title">What the extension keeps in your browser</h2>
+      </div>
+      <div class="technical-grid">
+        <article class="panel"><h3>Local download history</h3><p>The extension keeps IDs and progress for each processed reply in your browser profile. <strong>Clear download history</strong> pauses Continue and forgets these records. Files stay on disk.</p></article>
+        <article class="panel"><h3>Session and diagnostics</h3><p>Both modes use your signed-in ChatGPT session. The popup reports interrupted downloads and unconfirmed follow-ups. Temporary delivery URLs are kept out of the extension’s stored records.</p></article>
+      </div>
+      <p class="test-note">The automated tests use simulated chats and downloads to check cleanup, download order and retries. <a href="https://github.com/EKYavsil/ChatGPT-Continue-Cleanup-Helper/blob/main/tests/README.md">Read the test report</a>.</p>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>ChatGPT File Continue &amp; Cleanup Helper</p>
+    <p><a href="https://ekyavsil.github.io/AoE4-Replay-Launcher/">AoE4 Replay Launcher</a></p>
+    <p><a href="https://github.com/EKYavsil/ChatGPT-Continue-Cleanup-Helper">GitHub</a></p>
+  </footer>
+</body>
+</html>

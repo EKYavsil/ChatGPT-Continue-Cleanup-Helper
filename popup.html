@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT File Continue & Cleanup Helper</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>ChatGPT File Continue & Cleanup Helper</h1>
+      </header>
+
+      <section class="switch-group">
+        <div class="switch-row">
+          <div>
+            <strong>ChatGPT Continue</strong>
+            <small>Turn this on to keep ChatGPT generating files automatically when it stops during long file-generation tasks.</small>
+          </div>
+          <label class="switch">
+            <input id="enabled" type="checkbox">
+            <span></span>
+          </label>
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <strong>Delete non-project chats</strong>
+            <small>Deletes chats outside projects from the ChatGPT sidebar one by one.</small>
+          </div>
+          <label class="switch">
+            <input id="deleteNonProjectChatsEnabled" type="checkbox">
+            <span></span>
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <div class="label">Status</div>
+        <p id="status">Ready</p>
+      </section>
+
+      <label>
+        Continue text
+        <input id="continueText" type="text" autocomplete="off">
+      </label>
+
+      <label>
+        Download folder
+        <input id="downloadSubfolder" type="text" autocomplete="off">
+      </label>
+
+      <label>
+        Delay before downloading (sec)
+        <input id="delayBeforeDownloadSeconds" type="number" min="0" max="60" step="0.1" autocomplete="off">
+      </label>
+
+      <label>
+        Delay between downloads (sec)
+        <input id="delayBetweenDownloadsSeconds" type="number" min="0" max="10" step="0.1" autocomplete="off">
+      </label>
+
+      <button id="resetHistory" type="button">Clear download history</button>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

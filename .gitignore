@@ -1,0 +1,7 @@
+*.crx
+*.pem
+*.zip
+dist/
+build/
+.DS_Store
+Thumbs.db
