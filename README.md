@@ -14,7 +14,7 @@ ChatGPT produced the cards in batches across several replies. The extension down
 
 ## Install
 
-1. Clone this repository or choose **Code → Download ZIP** on GitHub and extract the archive.
+1. [Download the extension (v1.1.3 ZIP)](https://github.com/EKYavsil/ChatGPT-Continue-Cleanup-Helper/releases/download/v1.1.3/ChatGPT-Continue-Cleanup-Helper-v1.1.3.zip) and extract the archive, or clone this repository.
 2. Open `chrome://extensions` in Chrome or `brave://extensions` in Brave. Enable **Developer mode**.
 3. Choose **Load unpacked** and select the folder containing `manifest.json`.
 4. Open or reload a ChatGPT conversation, then open the extension from the browser toolbar.
